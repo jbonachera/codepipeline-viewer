@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/codebuild"
+	codebuildTypes "github.com/aws/aws-sdk-go-v2/service/codebuild/types"
 	"github.com/aws/aws-sdk-go-v2/service/codepipeline"
 	"github.com/aws/aws-sdk-go-v2/service/codepipeline/types"
 	"github.com/aws/aws-sdk-go/aws"
@@ -16,18 +18,19 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const pipelineBody = `{{ .PipelineName | bold | underline}}
-{{ range $index, $stage := .StageStates -}}
+const pipelineBody = `{{ .State.PipelineName | bold | underline}}
+{{ range $index, $stage := .State.StageStates -}}
 {{ $stage | stageDot }}  {{ $stage.StageName }}
 {{- if isActionDetailRequired $stage }}
 {{- range $index,$action := $stage.ActionStates }}
 {{"   "}}{{ $action | actionDot }} {{$action.ActionName}} {{ if hasActionRun $action }}({{ $action | actionLastExecution}}){{ end }}
+{{- if isActionCodebuild $.Definition $action }}
+{{"     "}}{{ codebuildDetails $.Builds $action }}
+{{- end -}}
 {{- end }}
 {{ else }} ({{ $stage | stageLastExecution}})
-{{ end -}}
-{{ end -}}
-`
-const pipelineSummaryBody = `{{ . | pipelineDot }} {{ .PipelineName }} {{ if hasPipelineRun . }}({{ . | pipelineLastExecution}}){{ end }}`
+{{ end }}{{ end }}`
+const pipelineSummaryBody = `{{ .State | pipelineDot }} {{ .State.PipelineName }} {{ if hasPipelineRun .State }}({{ .State | pipelineLastExecution}}){{ end }}`
 
 const reset = "\033[0m"
 const black = "235"
@@ -48,12 +51,20 @@ type templates struct {
 
 var defaultTemplates templates
 
+type PipelineContext struct {
+	codepipelineClient *codepipeline.Client
+	codebuildClient    *codebuild.Client
+	Definition         *codepipeline.GetPipelineOutput
+	State              *codepipeline.GetPipelineStateOutput
+	Builds             []*codebuild.BatchGetBuildsOutput
+}
+
 func init() {
 	summaryTemplate, err := template.New("CodePipelineSummary").Funcs(FuncMap).Parse(fmt.Sprintf("%s\n", pipelineSummaryBody))
 	if err != nil {
 		panic(err)
 	}
-	pipelineTemplate, err := template.New("CodePipelineSummary").Funcs(FuncMap).Parse(fmt.Sprintf("%s\n", pipelineBody))
+	pipelineTemplate, err := template.New("CodePipelineBody").Funcs(FuncMap).Parse(fmt.Sprintf("%s\n", pipelineBody))
 	if err != nil {
 		panic(err)
 	}
@@ -191,12 +202,38 @@ var FuncMap = template.FuncMap{
 		}
 		return false
 	},
+	"codebuildDetails": func(buildBatches []*codebuild.BatchGetBuildsOutput, stateAction *types.ActionState) string {
+		for _, batch := range buildBatches {
+			for _, build := range batch.Builds {
+				if *build.Id == *stateAction.LatestExecution.ExternalExecutionId {
+					for _, phase := range build.Phases {
+						if phase.PhaseStatus == codebuildTypes.StatusTypeFailed {
+							for _, phaseContext := range phase.Contexts {
+								return fmt.Sprintf("%s: %s", phase.PhaseType, *phaseContext.Message)
+							}
+						}
+					}
+				}
+			}
+		}
+		return ""
+	},
+	"isActionCodebuild": func(definition *codepipeline.GetPipelineOutput, stateAction *types.ActionState) bool {
+		for _, stage := range definition.Pipeline.Stages {
+			for _, action := range stage.Actions {
+				if *action.Name == *stateAction.ActionName {
+					return *action.ActionTypeId.Provider == "CodeBuild"
+				}
+			}
+		}
+		return false
+	},
 }
 
-func WritePipelineState(input *codepipeline.GetPipelineStateOutput, w io.Writer) error {
+func WritePipelineState(input PipelineContext, w io.Writer) error {
 	return defaultTemplates.Pipeline.Execute(w, input)
 }
-func WritePipelineSummary(input *codepipeline.GetPipelineStateOutput, w io.Writer) error {
+func WritePipelineSummary(input PipelineContext, w io.Writer) error {
 	return defaultTemplates.PipelineSummary.Execute(w, input)
 }
 
@@ -209,6 +246,7 @@ func main() {
 		log.Fatalf("unable to load SDK config, %v", err)
 	}
 	codepipelineClient := codepipeline.NewFromConfig(cfg)
+	codebuildClient := codebuild.NewFromConfig(cfg)
 	rootCmd := &cobra.Command{
 		Use: "pipeline-cli",
 	}
@@ -233,7 +271,11 @@ func main() {
 						log.Fatalf("failed to load pipeline state: %v", err)
 						continue
 					}
-					err = WritePipelineSummary(out, cmd.OutOrStdout())
+					err = WritePipelineSummary(PipelineContext{
+						codebuildClient:    codebuildClient,
+						codepipelineClient: codepipelineClient,
+						State:              out,
+					}, cmd.OutOrStdout())
 					if err != nil {
 						log.Fatalf("failed to render pipeline summary, %v", err)
 					}
@@ -245,20 +287,56 @@ func main() {
 			}
 		},
 	})
-	rootCmd.AddCommand(&cobra.Command{
+	getCmd := &cobra.Command{
 		Use:  "get",
 		Args: cobra.ExactArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
+			configOut, err := codepipelineClient.GetPipeline(cmd.Context(), &codepipeline.GetPipelineInput{Name: aws.String(args[0])})
+			if err != nil {
+				log.Fatalf("failed to load pipeline configuration, %v", err)
+			}
+			codeBuildActionName := ""
+			for _, stage := range configOut.Pipeline.Stages {
+				for _, action := range stage.Actions {
+					if *action.ActionTypeId.Provider == "CodeBuild" {
+						codeBuildActionName = *action.Name
+						break
+					}
+				}
+				if codeBuildActionName != "" {
+					break
+				}
+			}
 			out, err := codepipelineClient.GetPipelineState(cmd.Context(), &codepipeline.GetPipelineStateInput{Name: aws.String(args[0])})
 			if err != nil {
 				log.Fatalf("failed to load pipeline state, %v", err)
 			}
-			err = WritePipelineState(out, cmd.OutOrStdout())
+			pipelineContext := PipelineContext{
+				codebuildClient:    codebuildClient,
+				codepipelineClient: codepipelineClient,
+				State:              out,
+				Definition:         configOut,
+			}
+			for _, stage := range out.StageStates {
+				for _, action := range stage.ActionStates {
+					if *action.ActionName == codeBuildActionName {
+						build, err := codebuildClient.BatchGetBuilds(cmd.Context(), &codebuild.BatchGetBuildsInput{
+							Ids: []*string{action.LatestExecution.ExternalExecutionId},
+						})
+						if err != nil {
+							log.Fatalf("failed to render pipeline state, %v", err)
+						}
+						pipelineContext.Builds = append(pipelineContext.Builds, build)
+					}
+				}
+			}
+			err = WritePipelineState(pipelineContext, cmd.OutOrStdout())
 			if err != nil {
 				log.Fatalf("failed to render pipeline state, %v", err)
 			}
 		},
-	})
+	}
+	rootCmd.AddCommand(getCmd)
 	rootCmd.AddCommand(&cobra.Command{
 		Use:  "watch",
 		Args: cobra.ExactArgs(1),
@@ -266,15 +344,9 @@ func main() {
 			writer := uilive.New()
 			ticker := time.NewTicker(1 * time.Second)
 			defer ticker.Stop()
+			cmd.SetOut(writer)
 			for {
-				out, err := codepipelineClient.GetPipelineState(cmd.Context(), &codepipeline.GetPipelineStateInput{Name: aws.String(args[0])})
-				if err != nil {
-					log.Fatalf("failed to load pipeline state, %v", err)
-				}
-				err = WritePipelineState(out, writer)
-				if err != nil {
-					log.Fatalf("failed to render pipeline state, %v", err)
-				}
+				getCmd.Run(cmd, args)
 				writer.Flush()
 				<-ticker.C
 			}

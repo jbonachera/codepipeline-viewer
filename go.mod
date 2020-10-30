@@ -5,6 +5,7 @@ go 1.14
 require (
 	github.com/aws/aws-sdk-go v1.35.17
 	github.com/aws/aws-sdk-go-v2/config v0.2.1
+	github.com/aws/aws-sdk-go-v2/service/codebuild v0.28.0
 	github.com/aws/aws-sdk-go-v2/service/codepipeline v0.28.0
 	github.com/dustin/go-humanize v1.0.0
 	github.com/gosuri/uilive v0.0.4
